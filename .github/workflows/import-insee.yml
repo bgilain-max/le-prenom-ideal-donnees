@@ -51,4 +51,6 @@ jobs:
         env:
           INSEE_SOURCE_DIR: source/insee-lots
           SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
-        run: "$RUNNER_TEMP/insee-venv/bin/python" .github/scripts/import_insee.py
+        run: |
+          "$RUNNER_TEMP/insee-venv/bin/python" .github/scripts/import_insee.py
+        
