@@ -1,0 +1,122 @@
+name: Vérifier le rôle Supabase INSEE — lecture seule
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Saisir exactement VERIFIER-ROLE-DB-LECTURE-SEULE (aucune importation ni écriture)"
+        required: true
+        type: string
+
+# Le workflow n'appelle aucune action et n'a besoin d'aucun accès au dépôt.
+permissions: {}
+
+concurrency:
+  group: check-insee-db-role
+  cancel-in-progress: false
+
+jobs:
+  check-role:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.confirmation == 'VERIFIER-ROLE-DB-LECTURE-SEULE' }}
+    environment:
+      name: insee-import
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Installer le pilote PostgreSQL isolément
+        run: |
+          python3 -m venv "$RUNNER_TEMP/role-check-venv"
+          "$RUNNER_TEMP/role-check-venv/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            "psycopg[binary]==3.3.6"
+
+      - name: Vérifier le rôle et les droits sans lire de données
+        env:
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: |
+          "$RUNNER_TEMP/role-check-venv/bin/python" - <<'PY'
+          import os
+          import sys
+          import psycopg
+
+          dsn = os.environ.get("SUPABASE_DATABASE_URL", "")
+          if not dsn.startswith(("postgresql://", "postgres://")):
+              print("Échec : le secret requis est absent ou n'est pas une URL PostgreSQL. Valeur masquée.")
+              sys.exit(1)
+
+          query = """
+              SELECT
+                  current_user,
+                  role.rolsuper,
+                  role.rolbypassrls,
+                  relation.relowner = role.oid,
+                  has_table_privilege(current_user, relation.oid, 'INSERT'),
+                  has_table_privilege(current_user, relation.oid, 'SELECT'),
+                  relation.relrowsecurity,
+                  relation.relforcerowsecurity
+              FROM pg_roles AS role
+              JOIN pg_class AS relation
+                ON relation.oid = to_regclass('public.insee_observations')
+              WHERE role.rolname = current_user
+          """
+
+          try:
+              with psycopg.connect(
+                  dsn,
+                  sslmode="require",
+                  connect_timeout=15,
+              ) as conn:
+                  # Verrouille la transaction en lecture seule avant toute requête.
+                  conn.execute("SET TRANSACTION READ ONLY")
+                  row = conn.execute(query).fetchone()
+
+              if row is None:
+                  print("Échec : rôle courant ou table cible introuvable. Détails masqués.")
+                  sys.exit(1)
+
+              (
+                  role_name,
+                  is_superuser,
+                  bypass_rls,
+                  is_table_owner,
+                  can_insert,
+                  can_select,
+                  rls_enabled,
+                  force_rls,
+              ) = row
+
+              role_guard_ok = (
+                  (bool(is_superuser) or (bool(is_table_owner) and bool(bypass_rls)))
+                  and bool(can_insert)
+                  and bool(can_select)
+              )
+              rls_state_ok = bool(rls_enabled) and bool(force_rls)
+              compatible = role_guard_ok and rls_state_ok
+
+              print("Rôle PostgreSQL connecté :", ascii(str(role_name)))
+              print("Superutilisateur :", "oui" if is_superuser else "non")
+              print("BYPASSRLS :", "oui" if bypass_rls else "non")
+              print("Propriétaire de la table :", "oui" if is_table_owner else "non")
+              print("Droit INSERT :", "oui" if can_insert else "non")
+              print("Droit SELECT :", "oui" if can_select else "non")
+              print("RLS activée :", "oui" if rls_enabled else "non")
+              print("FORCE RLS activé :", "oui" if force_rls else "non")
+              print("Compatible avec le garde-fou actuel de l'importeur :", "oui" if compatible else "non")
+              print("Résultat :", "COMPATIBLE" if compatible else "NON COMPATIBLE")
+              sys.exit(0 if compatible else 1)
+
+          except psycopg.Error as error:
+              # Ne jamais imprimer error, error.args, la DSN ou un traceback.
+              sqlstate = getattr(error, "sqlstate", None)
+              if isinstance(sqlstate, str) and len(sqlstate) == 5 and sqlstate.isalnum():
+                  print(f"Échec de connexion ou du contrôle (SQLSTATE {sqlstate}). Détails masqués.")
+              else:
+                  print("Échec de connexion ou du contrôle. Détails masqués.")
+              sys.exit(1)
+          except Exception:
+              # Même les erreurs inattendues restent expurgées des journaux.
+              print("Échec inattendu du contrôle. Détails masqués.")
+              sys.exit(1)
+          PY
