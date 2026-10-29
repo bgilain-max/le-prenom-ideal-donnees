@@ -1,0 +1,76 @@
+
+name: Decoupage INSEE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  decoupage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer les fichiers
+        uses: actions/checkout@v4
+
+      - name: Decouper et verifier les CSV
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          sources = sorted(Path('.').glob('INSEE_prenoms_2025_national_partie_*.csv'))
+          if len(sources) != 4:
+              raise SystemExit(f'4 fichiers attendus, {len(sources)} trouves')
+
+          dest = Path('insee-lots')
+          dest.mkdir(exist_ok=True)
+          for old in dest.glob('*.csv'):
+              old.unlink()
+
+          total = 0
+          for source in sources:
+              with source.open('rb') as f:
+                  original_header = f.readline()
+                  if original_header.decode('utf-8-sig').strip() != 'sexe;prenom;periode;valeur;rang':
+                      raise SystemExit(f'En-tete inattendu : {source}')
+                  header = b'sexe;prenom;periode;valeur;rang\n'
+                  part, count, written = 0, 0, 0
+                  out = None
+                  try:
+                      for line in f:
+                          if not line.strip():
+                              raise SystemExit(f'Ligne vide dans {source}')
+                          if len(line.decode('utf-8').rstrip('\r\n').split(';')) != 5:
+                              raise SystemExit(f'Ligne invalide dans {source}, vers {count+1}')
+                          if out is None or written + len(line) > 900000:
+                              if out:
+                                  out.close()
+                              part += 1
+                              out = (dest / f'{source.stem}_lot_{part:03d}.csv').open('wb')
+                              out.write(header)
+                              written = len(header)
+                          out.write(line)
+                          written += len(line)
+                          count += 1
+                  finally:
+                      if out:
+                          out.close()
+              total += count
+              print(f'{source.name} : {count} donnees, {part} lots')
+              if count == 0:
+                  raise SystemExit(f'Fichier vide : {source}')
+
+          print(f'TOTAL : {total} lignes de donnees')
+          with (dest / 'bilan.txt').open('w') as f:
+              f.write(f'Total lignes de donnees : {total}\n')
+
+      - name: Enregistrer les lots sur GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add insee-lots/
+          if ! git diff --cached --quiet; then
+            git commit -m "Ajouter les lots INSEE verifies"
+            git push
+          fi
