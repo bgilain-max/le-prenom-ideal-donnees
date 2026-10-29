@@ -273,6 +273,37 @@ def verify_schema_and_protections(cur) -> None:
 
     cur.execute(
         """
+        SELECT pg_get_constraintdef(oid), convalidated
+        FROM pg_constraint
+        WHERE conrelid = 'public.insee_observations'::regclass
+          AND contype = 'c'
+        """
+    )
+    check_constraints = cur.fetchall()
+    actual_checks = {
+        re.sub(r"\s+", "", definition).lower()
+        for definition, _ in check_constraints
+    }
+    expected_checks = {
+        "check(((periode>=1900)and(periode<=2025)))",
+        "check((length(btrim(prenom))>0))",
+        "check((rang>=1))",
+        "check((sexe=any(array[1,2])))",
+        "check(((valeur>=0)and((valeur%5)=0)))",
+    }
+
+    if (
+        len(check_constraints) != len(expected_checks)
+        or actual_checks != expected_checks
+        or any(not validated for _, validated in check_constraints)
+    ):
+        abort(
+            "Les contraintes CHECK de public.insee_observations "
+            "ont changé ou ne sont pas validées."
+        )
+
+    cur.execute(
+        """
         SELECT c.relrowsecurity, c.relforcerowsecurity
         FROM pg_class AS c
         JOIN pg_namespace AS n
