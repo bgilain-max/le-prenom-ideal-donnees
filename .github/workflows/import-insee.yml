@@ -1,0 +1,54 @@
+name: Import INSEE complet — lancement manuel
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Saisir exactement IMPORTER-724645 pour lancer les contrôles et l’import"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: insee-full-import
+  cancel-in-progress: false
+
+jobs:
+  import-insee:
+    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.confirmation == 'IMPORTER-724645' }}
+    environment:
+      name: insee-import
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Récupérer le dépôt du workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Récupérer le jeu INSEE figé
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bgilain-max/le-prenom-ideal-donnees
+          ref: 01db0a59a6d0f3e82fa14ad36f4046df48819fd7
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Installer le pilote PostgreSQL isolément
+        run: |
+          python3 -m venv "$RUNNER_TEMP/insee-venv"
+          "$RUNNER_TEMP/insee-venv/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            "psycopg[binary]==3.3.6"
+
+      - name: Contrôler et importer
+        env:
+          INSEE_SOURCE_DIR: source/insee-lots
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: "$RUNNER_TEMP/insee-venv/bin/python" .github/scripts/import_insee.py
