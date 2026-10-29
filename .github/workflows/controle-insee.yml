@@ -1,0 +1,89 @@
+name: Controle INSEE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  controle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer les fichiers
+        uses: actions/checkout@v4
+
+      - name: Verifier les 22 fichiers INSEE
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import pathlib
+          import sys
+
+          dossier = pathlib.Path("insee-lots")
+          fichiers = sorted(dossier.glob("INSEE_prenoms_2025_national_partie_*_lot_*.csv"))
+          erreurs = []
+          cles = {}
+          total = 0
+          octets = 0
+          empreintes = []
+
+          for fichier in fichiers:
+              nombre = 0
+              contenu = fichier.read_bytes()
+              octets += len(contenu)
+              sha = hashlib.sha256(contenu).hexdigest()
+              empreintes.append((fichier.name, sha))
+
+              try:
+                  with fichier.open("r", encoding="utf-8-sig", newline="") as f:
+                      lecteur = csv.reader(f, delimiter=";")
+                      entete = next(lecteur, None)
+                      if entete != ["sexe", "prenom", "periode", "valeur", "rang"]:
+                          erreurs.append(f"{fichier.name}: en-tete incorrect")
+                      for numero, ligne in enumerate(lecteur, start=2):
+                          nombre += 1
+                          try:
+                              if len(ligne) != 5:
+                                  raise ValueError("nombre de colonnes incorrect")
+                              sexe, prenom, periode, valeur, rang = ligne
+                              s, p, v, r = int(sexe), int(periode), int(valeur), int(rang)
+                              if s not in (1, 2):
+                                  raise ValueError("sexe incorrect")
+                              if not prenom.strip():
+                                  raise ValueError("prenom vide")
+                              if not 1900 <= p <= 2025:
+                                  raise ValueError("periode incorrecte")
+                              if v < 0 or v % 5 != 0:
+                                  raise ValueError("valeur incorrecte")
+                              if r < 1:
+                                  raise ValueError("rang incorrect")
+                              cle = (s, prenom, p)
+                              if cle in cles:
+                                  raise ValueError(f"doublon avec {cles[cle]}")
+                              cles[cle] = f"{fichier.name}:{numero}"
+                          except (ValueError, TypeError) as e:
+                              erreurs.append(f"{fichier.name}:{numero}: {e}")
+              except (UnicodeError, OSError, csv.Error) as e:
+                  erreurs.append(f"{fichier.name}: lecture impossible: {e}")
+
+              total += nombre
+              print(f"{fichier.name} : {nombre} observations ; {len(contenu)} octets ; SHA256 {sha}")
+
+          print("\n===== BILAN FINAL =====")
+          print(f"Fichiers trouves : {len(fichiers)} / 22")
+          print(f"Observations : {total} / 724645")
+          print(f"Octets : {octets}")
+          print(f"Anomalies : {len(erreurs)}")
+
+          for erreur in erreurs[:100]:
+              print("ERREUR :", erreur)
+
+          if len(fichiers) != 22 or total != 724645 or erreurs:
+              print("RESULTAT : ECHEC - verification incomplete ou anomalies")
+              sys.exit(1)
+
+          print("RESULTAT : SUCCES - 22 fichiers et 724645 observations verifies")
+          PY
