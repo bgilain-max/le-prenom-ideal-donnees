@@ -1,0 +1,152 @@
+name: Vérification finale INSEE — lecture seule
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verification-finale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Récupérer le dépôt contenant les scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Récupérer la source INSEE au commit figé
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bgilain-max/le-prenom-ideal-donnees
+          ref: 01db0a59a6d0f3e82fa14ad36f4046df48819fd7
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Exécuter les cinq contrôles locaux
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          EXPECTED_COMMIT = "01db0a59a6d0f3e82fa14ad36f4046df48819fd7"
+          EXPECTED_FILE_COUNT = 22
+          EXPECTED_TOTAL_BYTES = 16_522_806
+          EXPECTED_TOTAL_ROWS = 724_645
+          EXPECTED_HEADER = ("sexe", "prenom", "periode", "valeur", "rang")
+
+          SCRIPT = Path(".github/scripts/import_insee.py")
+          IMPORT_WORKFLOW = Path(".github/workflows/import-insee.yml")
+          SOURCE_DIR = Path("source/insee-lots")
+          failures = []
+          inventory_cache = None
+
+          def csv_files():
+              global inventory_cache
+              if inventory_cache is None:
+                  if not SOURCE_DIR.is_dir():
+                      raise FileNotFoundError(f"Dossier source absent : {SOURCE_DIR}")
+                  inventory_cache = sorted(
+                      path for path in SOURCE_DIR.glob("*.csv") if path.is_file()
+                  )
+              return inventory_cache
+
+          def check_python_syntax():
+              source = SCRIPT.read_bytes()
+              compile(source, str(SCRIPT), "exec")
+              return "compilation syntaxique réussie; le script n'a pas été exécuté."
+
+          def check_import_yaml_syntax():
+              result = subprocess.run(
+                  [
+                      "ruby",
+                      "-e",
+                      "require 'yaml'; YAML.parse_file(ARGV.fetch(0))",
+                      str(IMPORT_WORKFLOW),
+                  ],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if result.returncode != 0:
+                  detail = (result.stderr or result.stdout).strip()
+                  raise RuntimeError(detail or "Le parseur YAML a refusé le fichier.")
+              return "syntaxe YAML valide."
+
+          def check_pinned_source_and_file_count():
+              result = subprocess.run(
+                  ["git", "-C", "source", "rev-parse", "HEAD"],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              )
+              actual_commit = result.stdout.strip()
+              files = csv_files()
+              problems = []
+              if actual_commit != EXPECTED_COMMIT:
+                  problems.append(
+                      f"commit {actual_commit} au lieu de {EXPECTED_COMMIT}"
+                  )
+              if len(files) != EXPECTED_FILE_COUNT:
+                  problems.append(
+                      f"{len(files)} CSV trouvés au lieu de {EXPECTED_FILE_COUNT}"
+                  )
+              if problems:
+                  raise RuntimeError("; ".join(problems))
+              return f"commit {actual_commit}; {len(files)} CSV présents."
+
+          def check_total_bytes():
+              files = csv_files()
+              total = sum(path.stat().st_size for path in files)
+              if total != EXPECTED_TOTAL_BYTES:
+                  raise RuntimeError(
+                      f"{total} octets constatés au lieu de {EXPECTED_TOTAL_BYTES}."
+                  )
+              return f"{total:,} octets au total.".replace(",", " ")
+
+          def check_data_rows():
+              total = 0
+              for path in csv_files():
+                  with path.open("r", encoding="utf-8-sig", newline="") as stream:
+                      reader = csv.reader(stream, delimiter=";", strict=True)
+                      header = next(reader, None)
+                      if tuple(header or ()) != EXPECTED_HEADER:
+                          raise RuntimeError(f"En-tête CSV inattendu : {path.name}.")
+                      for record in reader:
+                          if not record:
+                              raise RuntimeError(f"Ligne CSV vide : {path.name}.")
+                          total += 1
+              if total != EXPECTED_TOTAL_ROWS:
+                  raise RuntimeError(
+                      f"{total:,} lignes de données constatées au lieu de "
+                      f"{EXPECTED_TOTAL_ROWS:,}.".replace(",", " ")
+                  )
+              return f"{total:,} lignes de données, en-têtes exclus.".replace(",", " ")
+
+          def report(label, check):
+              try:
+                  detail = check()
+                  print(f"RÉUSSI — {label} : {detail}", flush=True)
+              except Exception as error:
+                  failures.append(label)
+                  print(f"ÉCHEC — {label} : {error}", flush=True)
+
+          report("1/5 Syntaxe Python (sans exécution)", check_python_syntax)
+          report("2/5 Syntaxe YAML du workflow d’import", check_import_yaml_syntax)
+          report("3/5 Commit figé et présence des 22 CSV", check_pinned_source_and_file_count)
+          report("4/5 Taille totale des CSV", check_total_bytes)
+          report("5/5 Nombre réel de lignes de données", check_data_rows)
+
+          if failures:
+              print("RÉSULTAT GLOBAL — ÉCHEC", flush=True)
+              sys.exit(1)
+
+          print("RÉSULTAT GLOBAL — RÉUSSI", flush=True)
+          PY
