@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import io
+import time
 import os
 import re
 import subprocess
@@ -117,7 +119,7 @@ def parse_integer(
 
 def parse_csv_into_copy(
     path: Path,
-    copy,
+    append_row,
     seen_keys: set[tuple[int, str, int]],
     pilot_rows: list[tuple[int, str, int, int, int]],
 ) -> int:
@@ -204,7 +206,7 @@ def parse_csv_into_copy(
                 seen_keys.add(key)
 
                 row = (sexe, prenom, periode, valeur, rang)
-                copy.write_row(row)
+                append_row(row)
 
                 if path.name == PILOT_FILE:
                     pilot_rows.append(row)
@@ -494,21 +496,42 @@ def run_import() -> tuple[int, int, int]:
                 """
             )
 
+            # COPY CSV par blocs: validation des lignes inchangée, mais transferts
+            # réseau groupés plutôt qu'un appel write_row pour chaque observation.
+            print("ÉTAPE 1/5 — Chargement CSV dans la table temporaire", flush=True)
+            started = time.monotonic()
             with cur.copy(
                 """
                 COPY insee_stage
                     (sexe, prenom, periode, valeur, rang)
-                FROM STDIN
+                FROM STDIN WITH (FORMAT CSV, DELIMITER ';', NULL '\\N')
                 """
             ) as copy:
+                buffer = io.StringIO()
+                writer = csv.writer(buffer, delimiter=";", lineterminator="\n")
+
+                def append_row(row):
+                    writer.writerow(row)
+                    if buffer.tell() >= 128 * 1024:
+                        copy.write(buffer.getvalue())
+                        buffer.seek(0)
+                        buffer.truncate(0)
+
                 for path in files:
                     total_rows += parse_csv_into_copy(
                         path,
-                        copy,
+                        append_row,
                         seen_keys,
                         pilot_rows,
                     )
 
+                if buffer.tell():
+                    copy.write(buffer.getvalue())
+            print(f"ÉTAPE 1/5 terminée — {total_rows} lignes, "
+                  f"{time.monotonic() - started:.1f} s", flush=True)
+
+            print("ÉTAPE 2/5 — Index et statistiques temporaires", flush=True)
+            started = time.monotonic()
             # Index temporaire pour les comparaisons exactes dans les deux sens.
             # Sans cet index, NOT EXISTS peut rescanner les 724 645 lignes
             # pour chaque observation de la table finale.
@@ -519,6 +542,7 @@ def run_import() -> tuple[int, int, int]:
                 """
             )
             cur.execute("ANALYZE insee_stage")
+            print(f"ÉTAPE 2/5 terminée — {time.monotonic() - started:.1f} s", flush=True)
 
             if total_rows != EXPECTED_TOTAL_ROWS:
                 abort(
@@ -560,6 +584,7 @@ def run_import() -> tuple[int, int, int]:
             if existing_count < PILOT_ROWS:
                 abort("Une ou plusieurs lignes du pilote initial sont absentes.")
 
+            print("CONTRÔLE — Correspondance des lignes existantes", flush=True)
             cur.execute(
                 f"""
                 SELECT EXISTS (
@@ -598,6 +623,8 @@ def run_import() -> tuple[int, int, int]:
                     "présentes à l'identique; import annulé."
                 )
 
+            print("ÉTAPE 3/5 — Insertion transactionnelle", flush=True)
+            started = time.monotonic()
             cur.execute(
                 f"""
                 INSERT INTO public.insee_observations
@@ -608,6 +635,8 @@ def run_import() -> tuple[int, int, int]:
                 """
             )
             inserted_this_run = cur.rowcount
+            print(f"ÉTAPE 3/5 terminée — {inserted_this_run} lignes ajoutées; "
+                  f"{time.monotonic() - started:.1f} s", flush=True)
 
             cur.execute("SELECT COUNT(*) FROM public.insee_observations")
             final_count = cur.fetchone()[0]
@@ -618,6 +647,8 @@ def run_import() -> tuple[int, int, int]:
                     f"(attendu : {EXPECTED_TOTAL_ROWS})."
                 )
 
+            print("ÉTAPE 4/5 — Comparaison finale des cinq champs", flush=True)
+            started = time.monotonic()
             cur.execute(
                 f"""
                 SELECT
@@ -649,7 +680,10 @@ def run_import() -> tuple[int, int, int]:
                     "transaction annulée."
                 )
 
+            print(f"ÉTAPE 4/5 terminée — {time.monotonic() - started:.1f} s", flush=True)
+            print("ÉTAPE 5/5 — Vérification des protections", flush=True)
             verify_schema_and_protections(cur)
+            print("ÉTAPE 5/5 terminée — validation de la transaction à suivre", flush=True)
 
     return total_rows, total_bytes, inserted_this_run
 
