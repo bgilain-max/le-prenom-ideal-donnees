@@ -509,6 +509,17 @@ def run_import() -> tuple[int, int, int]:
                         pilot_rows,
                     )
 
+            # Index temporaire pour les comparaisons exactes dans les deux sens.
+            # Sans cet index, NOT EXISTS peut rescanner les 724 645 lignes
+            # pour chaque observation de la table finale.
+            cur.execute(
+                """
+                CREATE INDEX insee_stage_match_idx
+                ON insee_stage (sexe, prenom, periode, valeur, rang)
+                """
+            )
+            cur.execute("ANALYZE insee_stage")
+
             if total_rows != EXPECTED_TOTAL_ROWS:
                 abort(
                     f"Nombre total d'observations inattendu : {total_rows} "
