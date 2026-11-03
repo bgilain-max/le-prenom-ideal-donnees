@@ -1,0 +1,104 @@
+name: Validation SSA USA (archive locale, sans Supabase)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssa-source-validation
+  cancel-in-progress: false
+
+jobs:
+  validate-ssa-source:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Recuperer le depot (lecture seule)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Controler l'archive officielle SSA sans import
+        shell: bash
+        run: |
+          python3 - <<'PYSSA'
+          import csv, hashlib, io, json, re, zipfile
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          path = Path('names.zip')
+          expected_sha256 = 'cd78e975ed7bb358e018dd62fbe14ced89295e9581c49172ca4eedcb011b3724'
+          first_year, last_year = 1880, 2025
+          max_bytes = 35_000_000
+
+          if not path.is_file():
+              raise FileNotFoundError(f'Archive manquante : {path}')
+          if path.stat().st_size > max_bytes:
+              raise ValueError('Archive plus grande que la limite de securite')
+          blob = path.read_bytes()
+          actual_sha256 = hashlib.sha256(blob).hexdigest()
+          if actual_sha256 != expected_sha256:
+              raise ValueError('Empreinte SHA256 inattendue : archive modifiee')
+          if not zipfile.is_zipfile(io.BytesIO(blob)):
+              raise ValueError('Archive ZIP invalide')
+
+          by_year = {}
+          with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+              for member in archive.infolist():
+                  if member.is_dir():
+                      continue
+                  match = re.fullmatch(r'yob(\d{4})\.txt', member.filename)
+                  if match:
+                      year = int(match.group(1))
+                      if year in by_year:
+                          raise ValueError(f'Annee en double : {year}')
+                      by_year[year] = member
+              expected = set(range(first_year, last_year + 1))
+              if set(by_year) != expected:
+                  raise ValueError(f'Annees manquantes ou inattendues : {sorted(set(by_year) ^ expected)}')
+              total_rows, by_year_rows = 0, {}
+              for year in sorted(by_year):
+                  member = by_year[year]
+                  if member.file_size > 10_000_000:
+                      raise ValueError(f'Fichier {year} trop grand')
+                  seen, sexes, count_rows = set(), set(), 0
+                  with archive.open(member) as source, io.TextIOWrapper(source, encoding='utf-8-sig', newline='') as text:
+                      for number, record in enumerate(csv.reader(text), 1):
+                          if len(record) != 3:
+                              raise ValueError(f'{year}:{number}: colonnes invalides')
+                          name, sex, count = record
+                          if not name or len(name) > 100 or '\x00' in name or sex not in ('F', 'M'):
+                              raise ValueError(f'{year}:{number}: nom ou sexe invalide')
+                          if not count.isascii() or not count.isdecimal() or int(count) < 5:
+                              raise ValueError(f'{year}:{number}: effectif invalide')
+                          if (sex, name) in seen:
+                              raise ValueError(f'{year}:{number}: doublon')
+                          seen.add((sex, name))
+                          sexes.add(sex)
+                          count_rows += 1
+                  if sexes != {'F', 'M'} or not count_rows:
+                      raise ValueError(f'{year}: fichier incomplet')
+                  by_year_rows[str(year)] = count_rows
+                  total_rows += count_rows
+
+          report = {
+              'source': 'https://www.ssa.gov/oact/babynames/names.zip',
+              'local_file': str(path),
+              'sha256': actual_sha256,
+              'archive_bytes': len(blob),
+              'first_year': first_year,
+              'last_year': last_year,
+              'years': len(by_year),
+              'rows': total_rows,
+              'rows_by_year': by_year_rows,
+              'validated_at_utc': datetime.now(timezone.utc).isoformat(),
+              'writes_to_database': False,
+              'note': 'SSA USA: usage par pays, et non origine culturelle. Absence ne signifie pas zero.'
+          }
+          print(f"VALIDATION SSA REUSSIE: {total_rows} lignes, {len(by_year)} annees")
+          print('SHA256:', actual_sha256)
+          print('Aucune connexion ni modification Supabase/INSEE')
+          PYSSA
