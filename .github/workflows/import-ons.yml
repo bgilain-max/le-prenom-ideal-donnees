@@ -1,0 +1,42 @@
+name: Import ONS 1996-2025 - Manuel
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Saisir IMPORTER-ONS-364184"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ons-full-import
+  cancel-in-progress: false
+
+jobs:
+  import-ons:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.confirmation == 'IMPORTER-ONS-364184' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ons-import
+    timeout-minutes: 30
+
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Installer Python et PostgreSQL
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ons-venv"
+          "$RUNNER_TEMP/ons-venv/bin/python" -m pip install --no-input --disable-pip-version-check "psycopg[binary]==3.3.6"
+
+      - name: Valider et importer les donnees ONS
+        env:
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+          ONS_CSV_PATH: ons-data/ONS_1996_2025_normalise_VALIDE.csv
+        run: |
+          "$RUNNER_TEMP/ons-venv/bin/python" .github/scripts/import_ons.py
